@@ -1,5 +1,11 @@
+//#define USE_PTHREAD
+
 #include "mex.h"
+#ifdef USE_PTHREAD
 #include <pthread.h>
+#else
+#include <thread>
+#endif
 #include <math.h>
 #include <string.h>
 
@@ -73,7 +79,11 @@ void *process(void *thread_arg) {
       }
     }
   }
+#ifdef USE_PTHREAD
   pthread_exit(NULL);
+#else
+  return nullptr;
+#endif
 }
 
 // matlab entry point
@@ -101,7 +111,11 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
 
   // start threads
   thread_data *td = (thread_data *)mxCalloc(len, sizeof(thread_data));
+#ifdef USE_PTHREAD
   pthread_t *ts = (pthread_t *)mxCalloc(len, sizeof(pthread_t));
+#else
+  std::thread *ts = new std::thread[len];
+#endif
   const mwSize *A_dims = mxGetDimensions(mxA);
   double *A = (double *)mxGetPr(mxA);
   for (int i = 0; i < len; i++) {
@@ -125,19 +139,33 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     td[i].mxC = mxCreateNumericArray(2, td[i].C_dims, mxDOUBLE_CLASS, mxREAL);
     td[i].C = (double *)mxGetPr(td[i].mxC);
 
+#ifdef USE_PTHREAD
     if (pthread_create(&ts[i], NULL, process, (void *)&td[i]))
       mexErrMsgTxt("Error creating thread");  
+#else
+    ts[i] = std::thread(process, (void *)&td[i]);
+#endif
   }
 
   // wait for the treads to finish and set return values
+#ifdef USE_PTHREAD
   void *status;
+#endif
   plhs[0] = mxCreateCellMatrix(1, len);
   for (int i = 0; i < len; i++) {
+#ifdef USE_PTHREAD
     pthread_join(ts[i], &status);
+#else
+    ts[i].join();
+#endif
     mxSetCell(plhs[0], i, td[i].mxC);
   }
   mxFree(td);
+#ifdef USE_PTHREAD
   mxFree(ts);
+#else
+  delete[] ts;
+#endif
 }
 
 

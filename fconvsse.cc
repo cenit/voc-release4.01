@@ -4,15 +4,21 @@
  * from what is computed by learn.cc and has not been thoroughly tested.
  */
 
+//#define USE_PTHREAD
+
 #include "mex.h"
+#ifdef USE_PTHREAD
 #include <pthread.h>
+#else
+#include <thread>
+#endif
 #include <xmmintrin.h>
 #include <stdint.h>
 
 // OS X aligns all memory at 16-byte boundaries (and doesn't provide
 // memalign/posix_memalign).  On linux, we use memalign to allocated 
 // 16-byte aligned memory.
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(_MSC_VER)
 #include <malloc.h>
 #define malloc_aligned(a,b) memalign(a,b)
 #else
@@ -20,6 +26,10 @@
 #endif
 
 #define IS_ALIGNED(ptr) ((((uintptr_t)(ptr)) & 0xF) == 0)
+
+#ifdef _MSC_VER
+inline void _mm_empty() {}
+#endif
 
 /**
  * Compile with:
@@ -63,15 +73,15 @@ void *process(void *thread_arg) {
 
   __m128 a,b,c;
   double *dst = C;
-  for (int x = 0; x < C_dims[1]; x++) {
-    for (int y = 0; y < C_dims[0]; y++) {
+  for (int x = 0; x < C_dims[1]; ++x) {
+    for (int y = 0; y < C_dims[0]; ++y) {
       __m128 v = _mm_setzero_ps();
       const float *A_src = A + y*NUM_FEATURES + x*A_dims[0]*NUM_FEATURES;
       const float *B_src = B;
-      for (int xp = 0; xp < B_dims[1]; xp++) {
+      for (int xp = 0; xp < B_dims[1]; ++xp) {
         const float *A_off = A_src;
         const float *B_off = B_src;
-        for (int yp = 0; yp < B_dims[0]; yp++) {
+        for (int yp = 0; yp < B_dims[0]; ++yp) {
           a = _mm_load_ps(A_off+0);
           b = _mm_load_ps(B_off+0);
           c = _mm_mul_ps(a, b);
@@ -122,30 +132,56 @@ void *process(void *thread_arg) {
         B_src += B_dims[0]*NUM_FEATURES;
       }
       // buf[] must be 16-byte aligned
-      float buf[4] __attribute__ ((aligned (16)));
+#ifdef _MSC_VER
+      __declspec(align(16)) float buf[4];
+#else
+      float buf[4] __attribute__ ((aligned(16)));
+#endif
       _mm_store_ps(buf, v);
       _mm_empty();
       *(dst++) = buf[0]+buf[1]+buf[2]+buf[3];
     }
   }
+#ifdef USE_PTHREAD
   pthread_exit(NULL);
+#else
+  return nullptr;
+#endif
 }
 
-float *prepare(double *in, const int *dims) {
+float *prepare(double *in, const unsigned long *dims) {
   float *F = (float *)malloc_aligned(16, dims[0]*dims[1]*dims[2]*sizeof(float));
   // Sanity check that memory is aligned
   if (!IS_ALIGNED(F))
     mexErrMsgTxt("Memory not aligned");
 
   float *p = F;
-  for (int x = 0; x < dims[1]; x++)
-    for (int y = 0; y < dims[0]; y++)
-      for (int f = 0; f < dims[2]; f++)
-        *(p++) = in[y + f*dims[0]*dims[1] + x*dims[0]];
-      for (int f = dims[2]; f < NUM_FEATURES; f++)
+  for (size_t x = 0; x < dims[1]; ++x)
+    for (size_t y = 0; y < dims[0]; ++y)
+      for (size_t f = 0; f < dims[2]; ++f)
+        *(p++) = (float)in[y + f*dims[0]*dims[1] + x*dims[0]];
+      for (size_t f = dims[2]; f < NUM_FEATURES; ++f)
         *(p++) = 0;
   return F;
 }
+
+#ifdef _MSC_VER
+float *prepare(double *in, const mwSize *dims) {
+  float *F = (float *)malloc_aligned(16, dims[0]*dims[1]*dims[2]*sizeof(float));
+  // Sanity check that memory is aligned
+  if (!IS_ALIGNED(F))
+    mexErrMsgTxt("Memory not aligned");
+
+  float *p = F;
+  for (size_t x = 0; x < dims[1]; ++x)
+    for (size_t y = 0; y < dims[0]; ++y)
+      for (size_t f = 0; f < dims[2]; ++f)
+        *(p++) = (float)in[y + f*dims[0]*dims[1] + x*dims[0]];
+      for (size_t f = dims[2]; f < NUM_FEATURES; ++f)
+        *(p++) = 0;
+  return F;
+}
+#endif
 
 // matlab entry point
 // C = fconv(A, cell of B, start, end);
@@ -172,10 +208,14 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
 
   // start threads
   thread_data *td = (thread_data *)mxCalloc(len, sizeof(thread_data));
+#ifdef USE_PTHREAD
   pthread_t *ts = (pthread_t *)mxCalloc(len, sizeof(pthread_t));
+#else
+  std::thread *ts = new std::thread[len];
+#endif
   const mwSize *A_dims = mxGetDimensions(mxA);
   float *A = prepare(mxGetPr(mxA), A_dims);
-  for (int i = 0; i < len; i++) {
+  for (int i = 0; i < len; ++i) {
     const mxArray *mxB = mxGetCell(cellB, i+start);
     td[i].A_dims = A_dims;
     td[i].A = A;
@@ -187,29 +227,42 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
       mexErrMsgTxt("Invalid input: B");
 
     // compute size of output
-    int height = td[i].A_dims[0] - td[i].B_dims[0] + 1;
-    int width = td[i].A_dims[1] - td[i].B_dims[1] + 1;
+    size_t height = td[i].A_dims[0] - td[i].B_dims[0] + 1;
+    size_t width = td[i].A_dims[1] - td[i].B_dims[1] + 1;
     if (height < 1 || width < 1)
       mexErrMsgTxt("Invalid input: B should be smaller than A");
     td[i].C_dims[0] = height;
     td[i].C_dims[1] = width;
     td[i].mxC = mxCreateNumericArray(2, td[i].C_dims, mxDOUBLE_CLASS, mxREAL);
     td[i].C = (double *)mxGetPr(td[i].mxC);
-
+#ifdef USE_PTHREAD
     if (pthread_create(&ts[i], NULL, process, (void *)&td[i]))
       mexErrMsgTxt("Error creating thread");  
+#else
+    ts[i] = std::thread(process, (void *)&td[i]);
+#endif
   }
 
   // wait for the treads to finish and set return values
+#ifdef USE_PTHREAD
   void *status;
+#endif
   plhs[0] = mxCreateCellMatrix(1, len);
-  for (int i = 0; i < len; i++) {
+  for (int i = 0; i < len; ++i) {
+#ifdef USE_PTHREAD
     pthread_join(ts[i], &status);
+#else
+    ts[i].join();
+#endif
     mxSetCell(plhs[0], i, td[i].mxC);
     free(td[i].B);
   }
   mxFree(td);
+#ifdef USE_PTHREAD
   mxFree(ts);
+#else
+  delete[] ts;
+#endif
   free(A);
 }
 

@@ -33,7 +33,7 @@ void resize1dtran(double *src, int sheight, double *dst, int dheight,
   // we cache the interpolation values since they can be 
   // shared among different columns
   int len = (int)ceil(dheight*invscale) + 2*dheight;
-  alphainfo ofs[len];
+  alphainfo* ofs = (alphainfo*)mxCalloc(len,sizeof(alphainfo));
   int k = 0;
   for (int dy = 0; dy < dheight; dy++) {
     double fsy1 = dy * invscale;
@@ -67,7 +67,8 @@ void resize1dtran(double *src, int sheight, double *dst, int dheight,
   }
 
   // resize each column of each color channel
-  bzero(dst, chan*width*dheight*sizeof(double));
+  memset(dst,0,chan*width*dheight*sizeof(double));
+  //bzero(dst, chan*width*dheight*sizeof(double));
   for (int c = 0; c < chan; c++) {
     for (int x = 0; x < width; x++) {
       double *s = src + c*width*sheight + x*sheight;
@@ -75,6 +76,7 @@ void resize1dtran(double *src, int sheight, double *dst, int dheight,
       alphacopy(s, d, ofs, k);
     }
   }
+  mxFree(ofs);
 }
 
 // main function
@@ -82,7 +84,7 @@ void resize1dtran(double *src, int sheight, double *dst, int dheight,
 // returns resized image
 mxArray *resize(const mxArray *mxsrc, const mxArray *mxscale) {
   double *src = (double *)mxGetPr(mxsrc);
-  const int *sdims = mxGetDimensions(mxsrc);
+  const size_t *sdims = mxGetDimensions(mxsrc);
   if (mxGetNumberOfDimensions(mxsrc) != 3 || 
       mxGetClassID(mxsrc) != mxDOUBLE_CLASS)
     mexErrMsgTxt("Invalid input");  
@@ -91,10 +93,10 @@ mxArray *resize(const mxArray *mxsrc, const mxArray *mxscale) {
   if (scale > 1)
     mexErrMsgTxt("Invalid scaling factor");   
 
-  int ddims[3];
-  ddims[0] = (int)round(sdims[0]*scale);
-  ddims[1] = (int)round(sdims[1]*scale);
-  ddims[2] = sdims[2];
+  const size_t ddims[3] = {(size_t)round(sdims[0]*scale), (size_t)round(sdims[1]*scale), (size_t)sdims[2]};
+//  ddims[0] = (int)round(sdims[0]*scale);
+//  ddims[1] = (int)round(sdims[1]*scale);
+//  ddims[2] = sdims[2];
   mxArray *mxdst = mxCreateNumericArray(3, ddims, mxDOUBLE_CLASS, mxREAL);
   double *dst = (double *)mxGetPr(mxdst);
 

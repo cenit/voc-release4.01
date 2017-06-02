@@ -28,7 +28,7 @@ void *process(void *thread_arg) {
   const mwSize *A_dims = args->A_dims;
   const mwSize *B_dims = args->B_dims;
   const mwSize *C_dims = args->C_dims;
-  int num_features = args->A_dims[2];
+  size_t num_features = args->A_dims[2];
 
   for (int f = 0; f < num_features; f++) {
     double *dst = C;
@@ -72,6 +72,7 @@ void *process(void *thread_arg) {
       }
     }
   }
+  return nullptr;
 }
 
 // matlab entry point
@@ -116,8 +117,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
       mexErrMsgTxt("Invalid input: B");
 
     // compute size of output
-    int height = td.A_dims[0] - td.B_dims[0] + 1;
-    int width = td.A_dims[1] - td.B_dims[1] + 1;
+    size_t height = td.A_dims[0] - td.B_dims[0] + 1;
+    size_t width = td.A_dims[1] - td.B_dims[1] + 1;
     if (height < 1 || width < 1)
       mexErrMsgTxt("Invalid input: B should be smaller than A");
     td.C_dims[0] = height;

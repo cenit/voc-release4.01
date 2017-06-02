@@ -1,4 +1,4 @@
-function [dets, boxes, info] = gdetect(pyra, model, thresh, bbox, overlap)
+function [dets, boxes, info, sp, xyls] = gdetect(pyra, model, modelinfo, priorinfo, bbox, overlap, filepath)
 
 % Detect objects in a feature pyramid using a model and a score threshold.
 % Higher threshold leads to fewer detections.
@@ -16,13 +16,19 @@ function [dets, boxes, info] = gdetect(pyra, model, thresh, bbox, overlap)
 % info contains detailed information about each detection required for 
 % extracted feature vectors during learning.
 %
+% sp contains the scores for individual parts
+%
 % If bbox is not empty, we pick the best detection with significant overlap. 
 %
 % pyra       feature pyramid structure returned by featpyramid.m
 % model      object model
-% threshold  score threshold
+% modelinfo  modelType, parts, threshold, weightfactor 
+% priorinfo  priors, xyls & testinfo
 % bbox       ground truth bounding box (in image coordinates)
 % overlap    bbox overlap requirement
+% filepath   path for the output (in case model needs to be saved)
+% Modified by Haroon Idrees, 2013
+% Please do not distribute.
 
 % set defaults for optional arguments
 if nargin < 4
@@ -35,41 +41,98 @@ end
 
 if nargin > 3 && ~isempty(bbox)
   latent = true;
-  thresh = -1000;
+  modelinfo.thresh = -1000;
 else
   latent = false;
 end
 
-% cache filter response
-model = filterresponses(model, pyra, latent, bbox, overlap);
-
-% compute parse scores
-L = model_sort(model);
-for s = L
-  for r = model.rules{s}
-    model = apply_rule(model, r, pyra.pady, pyra.padx);
-  end
-  model = symbol_score(model, s, latent, pyra, bbox, overlap);
+if ~isempty(priorinfo.xyls),
+    [priorinfo.xyls, indsort]=sortrows(priorinfo.xyls, 3);
+    priorinfo.scaleprior=[]; priorinfo.confprior=[];
 end
+    
+model.sP=[];
+L = model_sort(model);
+L_final = L(end); L = L(1:end-1); % separate symbol with structural rules
+
+if strcmp(model.note, 'rc16')==1 % got an 'empty' model
+    tic;
+    % cache filter response
+    model = filterresponses(model, pyra, latent, bbox, overlap);
+
+    % compute parse scores    
+    for s = L
+        for r = model.rules{s}
+            model = apply_rule(model, r, pyra.pady, pyra.padx);
+        end
+        model = symbol_score(model, s, latent, pyra, bbox, overlap);
+    end
+    model.note=filepath;
+    save(sprintf('%smodel.mat',filepath), 'model', '-v7.3'); 
+    fprintf('generated & saved model in %4.2f seconds\n', toc);
+end
+
+for r = model.rules{L_final}
+    model = apply_rule(model, r, pyra.pady, pyra.padx, modelinfo.parts);
+end
+model = symbol_score(model, L_final, latent, pyra, bbox, overlap);
 
 % find scores above threshold
 X = zeros(0, 'int32');
 Y = zeros(0, 'int32');
 I = zeros(0, 'int32');
 L = zeros(0, 'int32');
-S = [];
+S = []; 
+minthresh=-Inf;
+for iParts = 1:9,
+    sp1{iParts}=[]; sp2{iParts}=[]; sp{iParts}=[]; 
+end
+%                    size of head filter*HOG blocksize
+% actual head size = --------------------------------- -1
+%                     ratio w.r.t original image size
+headsizes=model.filters(1,3).size(1)*model.sbin./pyra.scales-1;
+
 for level = model.interval+1:length(pyra.scales)
   score = model.symbols(model.start).score{level};
-  tmpI = find(score > thresh);
+  
+  if isempty(priorinfo.xyls)
+      if ~isempty(priorinfo.scaleprior)
+          scalepad=padprior(score,priorinfo.scaleprior, model.sbin/pyra.scales(level), priorinfo.coordprior);
+          confpad=padprior(score,priorinfo.confprior, model.sbin/pyra.scales(level), priorinfo.coordprior);
+          
+          alpha=priorinfo.alpha;
+          beta=priorinfo.beta;
+          detthresh = modelinfo.thresh - alpha*confpad.*exp(-(1/beta)*(scalepad-headsizes(level-model.interval)).^2);
+          tmpI = find(score > detthresh);
+      else
+          tmpI = find(score > modelinfo.thresh);
+      end
+  else
+      indlevel=priorinfo.xyls(:,3)==level;
+      tmpI=sub2ind(size(score), priorinfo.xyls(indlevel,2), priorinfo.xyls(indlevel,1));
+  end
+  
+  if isempty(tmpI) && minthresh<max(score(:)), minthresh=max(score(:)); end;
   [tmpY, tmpX] = ind2sub(size(score), tmpI);
   X = [X; tmpX];
   Y = [Y; tmpY];
   I = [I; tmpI];
   L = [L; level*ones(length(tmpI), 1)];
   S = [S; score(tmpI)];
+  
+  for iParts=1:9
+    sp1{iParts}=[sp1{iParts}; model.sP{iParts}{level}{1}(tmpI)]; 
+    sp2{iParts}=[sp2{iParts}; model.sP{iParts}{level}{2}(tmpI)];
+  end
+  
 end
 
-[ign, ord] = sort(S, 'descend');
+if isempty(priorinfo.xyls)
+    [ign, ord] = sort(S, 'descend');
+else
+    [~,indunsort]=sort(indsort);
+    ord=indunsort;
+end
 % only return the highest scoring example in latent mode
 % (the overlap requirement has already been enforced)
 if latent && ~isempty(ord)
@@ -84,6 +147,22 @@ S = S(ord);
 % compute detection bounding boxes and parse information
 [dets, boxes, info] = getdetections(model, pyra.padx, pyra.pady, ...
                                     pyra.scales, X, Y, L, S);
+
+if isempty(dets), 
+    fprintf('No Detections...Min Thresh=%f\n', minthresh); 
+    dets=[]; boxes=[]; info=[]; sp=[]; xyls=[];
+    return;
+end
+
+for iParts=1:9,
+    sp{iParts}=[sp1{iParts}(ord), sp2{iParts}(ord)]; 
+    sp{iParts}=sp{iParts}( sub2ind([size(sp{iParts},1), 2], [1:size(sp{iParts},1)]', dets(:,5)) );
+end
+sp=cell2mat(sp);
+xyls=[double(X),double(Y),double(L),double(S)];
+
+% sanity check part scores
+sum(dets(:,6)-sum(sp,2)-model.rules{2}(1).offset.w);
 
 % sanity check overlap requirement
 if latent && ~isempty(dets)
@@ -136,14 +215,14 @@ model.symbols(s).score = score;
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % compute score pyramid for rule r
-function model = apply_rule(model, r, pady, padx)
+function model = apply_rule(model, r, pady, padx, parts)
 % model  object model
 % r      structural|deformation rule
 % pady   number of rows of feature map padding
 % padx   number of cols of feature map padding
 
 if r.type == 'S'
-  model = apply_structural_rule(model, r, pady, padx);
+  model = apply_structural_rule(model, r, pady, padx, parts);
 else
   model = apply_deformation_rule(model, r);
 end
@@ -151,7 +230,7 @@ end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % compute score pyramid for structural rule r
-function model = apply_structural_rule(model, r, pady, padx)
+function model = apply_structural_rule(model, r, pady, padx, parts)
 % model  object model
 % r      structural rule
 % pady   number of rows of feature map padding
@@ -181,6 +260,12 @@ for j = 1:length(r.rhs)
   startlevel = model.interval*ds + 1;
   % score table to shift and down sample
   s = model.symbols(r.rhs(j)).score;
+  % eliminate score for absent parts
+  if isempty(find(j==parts))
+      for iParts=1:size(s,2)
+          s{iParts}=0.*s{iParts};
+      end
+  end
   for i = startlevel:length(s)
     level = i - model.interval*ds;
     % ending points
@@ -201,6 +286,7 @@ for j = 1:length(r.rhs)
     stmp = -inf(size(score{i}));
     stmp(oy+1:oy+sz(1), ox+1:ox+sz(2)) = sp;
     score{i} = score{i} + stmp;
+    model.sP{j}{i}{r.i}=stmp;
   end
 end
 model.rules{r.lhs}(r.i).score = score;
@@ -383,3 +469,42 @@ else
     end
   end
 end
+
+function [newprior] = padprior(score, oldprior, scale, coordprior)
+
+% root filter dimensions
+dimroot=[5 15];
+
+% prior co-ordinates
+ptop=coordprior(2); pleft=coordprior(1); 
+pbottom=coordprior(4); pright=coordprior(3);
+
+% score map coordinates
+indscore=~isinf(score);
+[stop,sleft]=find(indscore==1, 1, 'first');
+[sbottom,sright]=find(indscore==1, 1, 'last');
+
+% prior coords mapped to score map
+maptop=ptop/scale+1+dimroot(2); mapleft=pleft/scale+1+dimroot(1);
+mapbottom=pbottom/scale+1+dimroot(2); mapright=pright/scale+1+dimroot(1);
+
+% transform prior to score map frame-of-reference
+tform=maketform('projective', [pleft ptop; pleft pbottom; pright ptop; pright pbottom],...
+                          [mapleft maptop; mapleft mapbottom; mapright maptop; mapright mapbottom]);
+newprior=imtransform(oldprior, tform, 'nearest', 'udata', [pleft pright], 'vdata', [ptop pbottom], 'xdata', [sleft sright], 'ydata', [stop sbottom], 'fillvalues', 0);
+
+% fprintf('-----------%0.4d/%0.4d-----------\n%0.4d/%0.4d-------------%0.4d/%0.4d\n-----------%0.4d/%0.4d-----------\n', ...
+%     stop, maptop, sleft, mapleft, sright, mapright, sbottom, mapbottom);
+
+% pad with infs
+top=stop-1; left=sleft-1;
+bottom=size(score,1)-sbottom; right=size(score,2)-sright;
+
+newprior = padarray(newprior,[0 left],'pre');
+newprior(:,1:left) = inf;
+newprior = padarray(newprior,[0 right],'post');
+newprior(:,size(newprior,2)-(right-1):end) = inf;
+newprior = padarray(newprior,[top 0],'pre');
+newprior(1:top,:) = inf;
+newprior = padarray(newprior,[bottom 0],'post');
+newprior(size(newprior,1)-(bottom-1):end,:) = inf;
